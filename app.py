@@ -1,9 +1,11 @@
 import streamlit as st
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from urllib.parse import quote
 import pandas as pd
 import re
 import time
+import sys
+import subprocess
+from urllib.parse import quote
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # =========================================================
@@ -11,13 +13,80 @@ import time
 # =========================================================
 
 st.set_page_config(
-    page_title="Deal Finder 🔥",
+    page_title="Deal Finder",
     page_icon="🔥",
     layout="wide"
 )
 
-st.title("🔥 Multi-Store Deal Finder")
-st.caption("Flipkart • Amazon India • Myntra")
+
+# =========================================================
+# PLAYWRIGHT BROWSER SETUP
+# =========================================================
+
+@st.cache_resource
+def start_playwright():
+
+    try:
+        playwright = sync_playwright().start()
+
+        # First try normal Chromium
+        try:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-http2",
+                    "--disable-quic",
+                    "--disable-gpu",
+                ]
+            )
+
+            return playwright, browser
+
+        except Exception:
+
+            # Browser binary may not exist on Streamlit Cloud
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "playwright",
+                        "install",
+                        "chromium"
+                    ],
+                    check=True,
+                    timeout=300
+                )
+
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-http2",
+                        "--disable-quic",
+                        "--disable-gpu",
+                    ]
+                )
+
+                return playwright, browser
+
+            except Exception as install_error:
+
+                playwright.stop()
+
+                raise RuntimeError(
+                    "Playwright Chromium could not be installed. "
+                    f"Details: {install_error}"
+                )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Browser startup failed: {e}"
+        )
 
 
 # =========================================================
@@ -27,89 +96,169 @@ st.caption("Flipkart • Amazon India • Myntra")
 STORE_CONFIG = {
 
     "Flipkart": {
-        "base_url": "https://www.flipkart.com/search?q=",
-        "product_selector": "a[href*='/p/']",
+        "selector": "a[href*='/p/']"
     },
 
     "Amazon": {
-        "base_url": "https://www.amazon.in/s?k=",
-        "product_selector": "a[href*='/dp/'], a[href*='/gp/product/']",
+        "selector": (
+            "a[href*='/dp/'], "
+            "a[href*='/gp/product/']"
+        )
     },
 
     "Myntra": {
-        "base_url": "https://www.myntra.com/search?q=",
-        "product_selector": "a[href*='/buy/'], a[href*='/product/']",
+        "selector": (
+            "a[href*='/buy/'], "
+            "a[href*='/product/']"
+        )
     }
 }
 
 
 # =========================================================
-# HELPERS
+# BASIC HELPERS
 # =========================================================
 
 def clean_text(text):
+
     if not text:
         return ""
 
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        str(text)
+    ).strip()
 
 
-def extract_number(value):
-    if value is None:
+def extract_number(text):
+
+    if text is None:
         return None
 
-    value = str(value)
-
-    # ₹1,299
-    match = re.search(r"[\d,]+(?:\.\d+)?", value)
+    match = re.search(
+        r"[\d,]+(?:\.\d+)?",
+        str(text)
+    )
 
     if not match:
         return None
 
     try:
-        return float(match.group().replace(",", ""))
+        return float(
+            match.group().replace(",", "")
+        )
     except:
         return None
 
 
+# =========================================================
+# PRICE
+# =========================================================
+
+def extract_prices(text):
+
+    if not text:
+        return None, None
+
+    prices = re.findall(
+        r"(?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d+)?",
+        text,
+        re.I
+    )
+
+    values = []
+
+    for price in prices:
+
+        number = extract_number(price)
+
+        if number is not None:
+            values.append(number)
+
+    values = list(
+        dict.fromkeys(values)
+    )
+
+    if not values:
+        return None, None
+
+    # Cheapest number is generally selling price
+    current_price = min(values)
+
+    # Highest number generally MRP
+    mrp = max(values)
+
+    if mrp == current_price:
+        mrp = None
+
+    return current_price, mrp
+
+
+# =========================================================
+# DISCOUNT
+# =========================================================
+
 def extract_discount(text):
+
     if not text:
         return None
 
     patterns = [
         r"(\d{1,3})\s*%\s*off",
-        r"(\d{1,3})\s*%\s*OFF",
-        r"(\d{1,3})%\s*discount",
+        r"(\d{1,3})\s*%\s*discount",
+        r"(\d{1,3})\s*%\s*OFF"
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.I)
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
 
         if match:
+
             try:
-                return float(match.group(1))
+                return float(
+                    match.group(1)
+                )
             except:
                 pass
 
     return None
 
 
+# =========================================================
+# RATING
+# =========================================================
+
 def extract_rating(text):
+
     if not text:
         return None
 
     patterns = [
         r"([0-5](?:\.\d)?)\s*(?:★|stars?)",
-        r"([0-5](?:\.\d)?)\s*\/\s*5",
+        r"([0-5](?:\.\d)?)\s*/\s*5"
     ]
 
     for pattern in patterns:
 
-        match = re.search(pattern, text, re.I)
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
 
         if match:
+
             try:
-                rating = float(match.group(1))
+
+                rating = float(
+                    match.group(1)
+                )
 
                 if 0 <= rating <= 5:
                     return rating
@@ -120,87 +269,73 @@ def extract_rating(text):
     return None
 
 
-def extract_prices(text):
+# =========================================================
+# IMAGE EXTRACTION
+# =========================================================
 
-    if not text:
-        return None, None
-
-    # ₹1,299 / ₹999 etc.
-    prices = re.findall(
-        r"(?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d+)?",
-        text,
-        re.I
-    )
-
-    numbers = []
-
-    for price in prices:
-
-        number = extract_number(price)
-
-        if number:
-            numbers.append(number)
-
-    # remove duplicates
-    numbers = list(dict.fromkeys(numbers))
-
-    if not numbers:
-        return None, None
-
-    # Usually first = selling price, second = MRP
-    current_price = min(numbers)
-
-    mrp = max(numbers)
-
-    if mrp == current_price:
-        mrp = None
-
-    return current_price, mrp
-
-
-def get_image_from_element(element):
+def get_image(element):
 
     try:
 
-        image = element.query_selector("img")
+        image = element.locator("img")
 
-        if not image:
+        if image.count() == 0:
             return None
+
+        image = image.first
 
         attributes = [
             "src",
             "data-src",
             "data-lazy-src",
             "data-original",
-            "data-image-url",
-            "data-image"
+            "data-image",
+            "data-image-url"
         ]
 
-        for attr in attributes:
+        for attribute in attributes:
 
             try:
-                value = image.get_attribute(attr)
 
-                if value and value.startswith("http"):
+                value = image.get_attribute(
+                    attribute
+                )
+
+                if (
+                    value
+                    and value.startswith("http")
+                    and not value.startswith("data:")
+                ):
                     return value
+
             except:
                 pass
 
         # srcset
         try:
 
-            srcset = image.get_attribute("srcset")
+            srcset = image.get_attribute(
+                "srcset"
+            )
 
             if srcset:
 
-                parts = srcset.split(",")
+                candidates = []
 
-                if parts:
+                for item in srcset.split(","):
 
-                    url = parts[-1].strip().split(" ")[0]
+                    item = item.strip()
+
+                    if not item:
+                        continue
+
+                    url = item.split(" ")[0]
 
                     if url.startswith("http"):
-                        return url
+                        candidates.append(url)
+
+                if candidates:
+                    return candidates[-1]
 
         except:
             pass
@@ -212,20 +347,21 @@ def get_image_from_element(element):
 
 
 # =========================================================
-# SCROLL PAGE TO LOAD LAZY IMAGES
+# SCROLL
 # =========================================================
 
 def scroll_page(page):
 
     try:
 
-        for _ in range(5):
+        for _ in range(6):
 
-            page.mouse.wheel(0, 1200)
+            page.mouse.wheel(
+                0,
+                1200
+            )
 
-            time.sleep(0.5)
-
-        page.mouse.wheel(0, -6000)
+            time.sleep(0.4)
 
         time.sleep(1)
 
@@ -234,60 +370,83 @@ def scroll_page(page):
 
 
 # =========================================================
-# BUILD SEARCH URL
+# URL BUILDERS
 # =========================================================
 
-def build_url(store, query, page_number):
+def build_url(
+    store,
+    query,
+    page_number
+):
 
-    encoded_query = quote(query)
+    encoded = quote(
+        query
+    )
+
+    # -------------------------------------
+    # AMAZON INDIA
+    # -------------------------------------
 
     if store == "Amazon":
 
-        # IMPORTANT:
-        # Always Amazon India
         return (
-            f"https://www.amazon.in/s?k={encoded_query}"
+            "https://www.amazon.in/"
+            f"s?k={encoded}"
             f"&page={page_number}"
         )
 
-    elif store == "Flipkart":
+    # -------------------------------------
+    # FLIPKART
+    # -------------------------------------
+
+    if store == "Flipkart":
+
+        if page_number == 1:
+
+            return (
+                "https://www.flipkart.com/"
+                f"search?q={encoded}"
+            )
 
         return (
-            f"https://www.flipkart.com/search?q={encoded_query}"
+            "https://www.flipkart.com/"
+            f"search?q={encoded}"
             f"&page={page_number}"
         )
 
-    elif store == "Myntra":
+    # -------------------------------------
+    # MYNTRA
+    # -------------------------------------
+
+    if store == "Myntra":
 
         return (
-            f"https://www.myntra.com/search?q={encoded_query}"
+            "https://www.myntra.com/"
+            f"search?q={encoded}"
             f"&p={page_number}"
         )
 
+    return ""
+
 
 # =========================================================
-# FIND PRODUCT CARD
+# PRODUCT CARD
 # =========================================================
 
-def find_card(element, store):
+def find_card(
+    link_element,
+    store
+):
 
     try:
 
         if store == "Amazon":
 
-            # Amazon search result container
-            card = element.locator(
-                "xpath=ancestor::*[@data-component-type='s-search-result'][1]"
-            )
-
-            if card.count() > 0:
-                return card.first
-
-        elif store == "Flipkart":
-
-            # Walk upwards until a reasonably sized container
-            card = element.locator(
-                "xpath=ancestor::div[.//img][1]"
+            card = link_element.locator(
+                "xpath="
+                "ancestor::*"
+                "[@data-component-type="
+                "'s-search-result'][1]"
             )
 
             if card.count() > 0:
@@ -295,40 +454,99 @@ def find_card(element, store):
 
         elif store == "Myntra":
 
-            card = element.locator(
-                "xpath=ancestor::li[.//img][1]"
+            card = link_element.locator(
+                "xpath="
+                "ancestor::li[.//img][1]"
             )
 
             if card.count() > 0:
                 return card.first
 
-            card = element.locator(
-                "xpath=ancestor::div[.//img][1]"
-            )
+        # Generic fallback
+        card = link_element.locator(
+            "xpath="
+            "ancestor::*[.//img][1]"
+        )
 
-            if card.count() > 0:
-                return card.first
+        if card.count() > 0:
+            return card.first
 
     except:
         pass
 
-    return element
+    return link_element
+
+
+# =========================================================
+# TITLE
+# =========================================================
+
+def get_title(
+    card,
+    link_element
+):
+
+    selectors = [
+        "h2",
+        "h3",
+        "[class*='title']",
+        "[class*='Title']",
+        "[class*='productName']",
+        "[class*='ProductName']"
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            element = card.locator(
+                selector
+            )
+
+            if element.count() > 0:
+
+                title = clean_text(
+                    element.first.inner_text(
+                        timeout=1000
+                    )
+                )
+
+                if len(title) > 5:
+
+                    return title[:300]
+
+        except:
+            pass
+
+    try:
+
+        title = clean_text(
+            link_element.inner_text(
+                timeout=1000
+            )
+        )
+
+        return title[:300]
+
+    except:
+        return ""
 
 
 # =========================================================
 # SCRAPE ONE PAGE
 # =========================================================
 
-def scrape_page(page, store, search_query, page_number):
+def scrape_page(
+    page,
+    store,
+    search_query,
+    page_number
+):
 
     url = build_url(
         store,
         search_query,
         page_number
-    )
-
-    st.write(
-        f"🔎 **{store} — Page {page_number}**"
     )
 
     try:
@@ -339,21 +557,19 @@ def scrape_page(page, store, search_query, page_number):
             timeout=45000
         )
 
-        # Give dynamic content time
         time.sleep(3)
 
-        # Check current URL
-        current_url = page.url
+        # -----------------------------------------
+        # AMAZON MUST STAY INDIA
+        # -----------------------------------------
 
         if store == "Amazon":
 
-            if "amazon.in" not in current_url.lower():
+            current_url = page.url.lower()
 
-                st.warning(
-                    f"Amazon redirected unexpectedly:\n{current_url}"
-                )
+            if "amazon.in" not in current_url:
 
-                # Try direct Amazon India again
+                # Retry once
                 page.goto(
                     url,
                     wait_until="domcontentloaded",
@@ -362,10 +578,24 @@ def scrape_page(page, store, search_query, page_number):
 
                 time.sleep(3)
 
-        # Scroll so lazy images load
+                current_url = page.url.lower()
+
+                if "amazon.in" not in current_url:
+
+                    return [], (
+                        "Amazon redirected away from "
+                        f"amazon.in: {page.url}"
+                    )
+
+        # -----------------------------------------
+        # LOAD LAZY CONTENT
+        # -----------------------------------------
+
         scroll_page(page)
 
-        selector = STORE_CONFIG[store]["product_selector"]
+        selector = STORE_CONFIG[
+            store
+        ]["selector"]
 
         try:
 
@@ -376,76 +606,163 @@ def scrape_page(page, store, search_query, page_number):
 
         except PlaywrightTimeoutError:
 
-            return [], f"No product links found on page {page_number}"
+            return [], (
+                f"No products found on page "
+                f"{page_number}"
+            )
 
-        links = page.locator(selector)
+        links = page.locator(
+            selector
+        )
 
         count = links.count()
 
         products = []
 
-        seen_links = set()
+        seen = set()
 
-        # Don't scrape infinite junk links
-        max_links = min(count, 80)
+        # Limit per page
+        max_links = min(
+            count,
+            100
+        )
 
-        for i in range(max_links):
+        for i in range(
+            max_links
+        ):
 
             try:
 
                 link_element = links.nth(i)
 
-                href = link_element.get_attribute("href")
+                href = link_element.get_attribute(
+                    "href"
+                )
 
                 if not href:
                     continue
 
-                # Convert relative links
+                # ---------------------------------
+                # ABSOLUTE LINK
+                # ---------------------------------
+
                 if href.startswith("/"):
 
                     if store == "Amazon":
-                        href = "https://www.amazon.in" + href
+
+                        href = (
+                            "https://www.amazon.in"
+                            + href
+                        )
 
                     elif store == "Flipkart":
-                        href = "https://www.flipkart.com" + href
+
+                        href = (
+                            "https://www.flipkart.com"
+                            + href
+                        )
 
                     elif store == "Myntra":
-                        href = "https://www.myntra.com" + href
 
-                # Clean URL
+                        href = (
+                            "https://www.myntra.com"
+                            + href
+                        )
+
                 href = href.split("?")[0]
 
-                if href in seen_links:
+                if href in seen:
                     continue
 
-                seen_links.add(href)
+                seen.add(href)
 
-                # Find card
+                # ---------------------------------
+                # CARD
+                # ---------------------------------
+
                 card = find_card(
                     link_element,
                     store
                 )
 
-                # Get card text
+                # ---------------------------------
+                # TEXT
+                # ---------------------------------
+
                 try:
+
                     text = clean_text(
-                        card.inner_text(timeout=3000)
+                        card.inner_text(
+                            timeout=3000
+                        )
                     )
+
                 except:
-                    text = clean_text(
-                        link_element.inner_text(timeout=2000)
-                    )
+
+                    try:
+
+                        text = clean_text(
+                            link_element.inner_text(
+                                timeout=2000
+                            )
+                        )
+
+                    except:
+
+                        text = ""
 
                 if not text:
                     continue
 
-                # -----------------------------
+                # ---------------------------------
+                # PRICE
+                # ---------------------------------
+
+                current_price, mrp = extract_prices(
+                    text
+                )
+
+                if current_price is None:
+                    continue
+
+                # ---------------------------------
+                # DISCOUNT
+                # ---------------------------------
+
+                discount = extract_discount(
+                    text
+                )
+
+                if (
+                    discount is None
+                    and mrp
+                    and mrp > current_price
+                ):
+
+                    discount = round(
+                        (
+                            (mrp - current_price)
+                            / mrp
+                        ) * 100,
+                        1
+                    )
+
+                # ---------------------------------
+                # RATING
+                # ---------------------------------
+
+                rating = extract_rating(
+                    text
+                )
+
+                # ---------------------------------
                 # IMAGE
-                # -----------------------------
+                # ---------------------------------
 
-                image_url = get_image_from_element(card)
+                image_url = get_image(
+                    card
+                )
 
-                # If card doesn't have image, try parent
                 if not image_url:
 
                     try:
@@ -454,110 +771,29 @@ def scrape_page(page, store, search_query, page_number):
                             "xpath=.."
                         )
 
-                        image_url = get_image_from_element(
+                        image_url = get_image(
                             parent
                         )
 
                     except:
                         pass
 
-                # -----------------------------
-                # PRICE
-                # -----------------------------
+                # ---------------------------------
+                # TITLE
+                # ---------------------------------
 
-                current_price, mrp = extract_prices(text)
+                title = get_title(
+                    card,
+                    link_element
+                )
 
-                if not current_price:
-                    continue
-
-                # -----------------------------
-                # DISCOUNT
-                # -----------------------------
-
-                discount = extract_discount(text)
-
-                # Calculate discount ourselves
-                if (
-                    discount is None
-                    and mrp
-                    and mrp > current_price
-                ):
-
-                    discount = round(
-                        ((mrp - current_price) / mrp) * 100,
-                        1
-                    )
-
-                # -----------------------------
-                # RATING
-                # -----------------------------
-
-                rating = extract_rating(text)
-
-                # -----------------------------
-                # PRODUCT TITLE
-                # -----------------------------
-
-                title = ""
-
-                try:
-
-                    # Try common title elements
-                    title_selectors = [
-                        "h2",
-                        "h3",
-                        "[data-cy='title-recipe']",
-                        "[class*='title']",
-                        "[class*='Title']"
-                    ]
-
-                    for selector_title in title_selectors:
-
-                        try:
-
-                            title_element = card.locator(
-                                selector_title
-                            )
-
-                            if title_element.count() > 0:
-
-                                candidate = clean_text(
-                                    title_element.first.inner_text(
-                                        timeout=1000
-                                    )
-                                )
-
-                                if (
-                                    candidate
-                                    and len(candidate) > 5
-                                ):
-                                    title = candidate
-                                    break
-
-                        except:
-                            pass
-
-                except:
-                    pass
-
-                # Fallback
                 if not title:
 
-                    try:
-                        title = clean_text(
-                            link_element.inner_text(
-                                timeout=1000
-                            )
-                        )
-                    except:
-                        title = ""
+                    title = "Product"
 
-                # Clean weird titles
-                title = title[:300]
-
-                # -----------------------------
-                # PRODUCT
-                # -----------------------------
+                # ---------------------------------
+                # SAVE
+                # ---------------------------------
 
                 products.append({
 
@@ -581,7 +817,7 @@ def scrape_page(page, store, search_query, page_number):
 
                 })
 
-            except Exception:
+            except:
                 continue
 
         return products, None
@@ -608,7 +844,6 @@ def scrape_store(
 
     try:
 
-        # India locale
         context = browser.new_context(
 
             locale="en-IN",
@@ -621,30 +856,26 @@ def scrape_store(
             },
 
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
                 "AppleWebKit/537.36 "
                 "(KHTML, like Gecko) "
-                "Chrome/154.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 "
+                "Safari/537.36"
             )
         )
 
         page = context.new_page()
 
-        # Block unnecessary resources only
-        # DON'T block images!
-        page.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in [
-                    "font",
-                    "media"
-                ]
-                else route.continue_()
-            )
-        )
+        for page_number in range(
+            1,
+            pages + 1
+        ):
 
-        for page_number in range(1, pages + 1):
+            st.write(
+                f"🔎 {store} — "
+                f"Page {page_number}"
+            )
 
             page_products, error = scrape_page(
                 page,
@@ -656,20 +887,23 @@ def scrape_store(
             if error:
 
                 st.warning(
-                    f"⚠️ {store} Page {page_number}: {error}"
+                    f"⚠️ {store} Page "
+                    f"{page_number}: {error}"
                 )
 
             if page_products:
 
-                results.extend(page_products)
+                results.extend(
+                    page_products
+                )
 
-            # Small pause between pages
             time.sleep(1)
 
     except Exception as e:
 
-        st.error(
-            f"❌ {store} failed: {str(e)}"
+        st.warning(
+            f"⚠️ {store} could not be searched: "
+            f"{e}"
         )
 
     finally:
@@ -686,28 +920,41 @@ def scrape_store(
 
 
 # =========================================================
-# UI
+# HEADER
 # =========================================================
 
-st.divider()
+st.title(
+    "🔥 Deal Finder"
+)
 
-col1, col2 = st.columns(2)
+st.caption(
+    "Compare deals across Flipkart, Amazon India & Myntra"
+)
 
-with col1:
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.header(
+        "🔎 Search Filters"
+    )
 
     store_choice = st.selectbox(
         "🛒 Store",
         [
+            "All 3",
             "Flipkart",
             "Amazon",
-            "Myntra",
-            "All 3"
+            "Myntra"
         ]
     )
 
     product = st.text_input(
         "🔍 Product",
-        placeholder="e.g. tshirt, shoes, laptop"
+        placeholder="e.g. shoes"
     )
 
     gender = st.selectbox(
@@ -722,16 +969,14 @@ with col1:
     )
 
     brand = st.text_input(
-        "🏷️ Brand (optional)",
-        placeholder="e.g. adidas, Nike, Puma"
+        "🏷️ Brand",
+        placeholder="Optional"
     )
 
-with col2:
-
     max_price = st.number_input(
-        "💰 Maximum price (₹)",
+        "💰 Maximum price",
         min_value=0,
-        value=1000,
+        value=2000,
         step=100
     )
 
@@ -743,8 +988,16 @@ with col2:
         step=0.1
     )
 
+    pages_to_scrape = st.number_input(
+        "📄 Pages to search",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1
+    )
+
     sort_by = st.selectbox(
-        "📊 Sort by",
+        "📊 Sort results",
         [
             "Cheapest",
             "Highest Discount",
@@ -752,64 +1005,65 @@ with col2:
         ]
     )
 
-    pages_to_scrape = st.number_input(
-        "📄 Number of pages",
-        min_value=1,
-        max_value=10,
-        value=3,
-        step=1,
-        help="Page 1, 2, 3... jitne select karoge utne pages scan honge."
-    )
+
+# =========================================================
+# SEARCH BUTTON
+# =========================================================
+
+search_clicked = st.button(
+    "🔥 FIND BEST DEALS",
+    type="primary",
+    use_container_width=True
+)
 
 
 # =========================================================
 # SEARCH
 # =========================================================
 
-if st.button(
-    "🔥 FIND BEST DEALS",
-    use_container_width=True
-):
+if search_clicked:
 
     if not product.strip():
 
-        st.warning(
+        st.error(
             "Please enter a product name."
         )
 
         st.stop()
 
-    # -----------------------------
+    # -----------------------------------------
     # BUILD QUERY
-    # -----------------------------
+    # -----------------------------------------
 
-    search_parts = []
+    query_parts = []
 
     if brand.strip():
-        search_parts.append(
+
+        query_parts.append(
             brand.strip()
         )
 
     if gender != "Any":
-        search_parts.append(
+
+        query_parts.append(
             gender
         )
 
-    search_parts.append(
+    query_parts.append(
         product.strip()
     )
 
     search_query = " ".join(
-        search_parts
+        query_parts
     )
 
     st.info(
-        f"🔎 Searching for: **{search_query}**"
+        f"🔍 Searching for: **{search_query}**"
     )
 
-    # -----------------------------
-    # WHICH STORES?
-    # -----------------------------
+    # -----------------------------------------
+    # STORES
+    # -----------------------------------------
 
     if store_choice == "All 3":
 
@@ -825,102 +1079,118 @@ if st.button(
             store_choice
         ]
 
+    # -----------------------------------------
+    # BROWSER
+    # -----------------------------------------
+
+    try:
+
+        with st.spinner(
+            "🚀 Starting browser..."
+        ):
+
+            playwright, browser = start_playwright()
+
+    except Exception as e:
+
+        st.error(
+            "❌ Browser could not start."
+        )
+
+        st.code(
+            str(e)
+        )
+
+        st.stop()
+
     all_products = []
 
-    # -----------------------------
-    # BROWSER
-    # -----------------------------
+    # -----------------------------------------
+    # SEARCH STORES
+    # -----------------------------------------
 
-    with st.spinner(
-        "🔥 Searching stores..."
-    ):
+    for store in stores:
 
-        with sync_playwright() as p:
+        st.subheader(
+            f"🛒 {store}"
+        )
 
-            try:
+        with st.spinner(
+            f"Searching {store}..."
+        ):
 
-                browser = p.chromium.launch(
+            products = scrape_store(
+                browser,
+                store,
+                search_query,
+                int(pages_to_scrape)
+            )
 
-                    channel="chrome",
+        if products:
 
-                    headless=False,
+            st.success(
+                f"{store}: "
+                f"{len(products)} products found"
+            )
 
-                    args=[
-                        "--disable-http2",
-                        "--disable-quic",
-                        "--lang=en-IN",
-                        "--disable-blink-features=AutomationControlled"
-                    ]
-                )
+            all_products.extend(
+                products
+            )
 
-            except Exception:
+        else:
 
-                # Fallback if Chrome channel isn't available
-                browser = p.chromium.launch(
+            st.warning(
+                f"{store}: No products found"
+            )
 
-                    headless=False,
+    # -----------------------------------------
+    # CLOSE
+    # -----------------------------------------
 
-                    args=[
-                        "--disable-http2",
-                        "--disable-quic",
-                        "--lang=en-IN"
-                    ]
-                )
+    try:
 
-            # -----------------------------
-            # EACH STORE
-            # -----------------------------
+        browser.close()
+        playwright.stop()
 
-            for store in stores:
-
-                st.subheader(
-                    f"🔎 {store}: {search_query}"
-                )
-
-                products = scrape_store(
-
-                    browser,
-
-                    store,
-
-                    search_query,
-
-                    int(pages_to_scrape)
-                )
-
-                all_products.extend(
-                    products
-                )
-
-            try:
-                browser.close()
-            except:
-                pass
+    except:
+        pass
 
     # =====================================================
-    # DATA PROCESSING
+    # NO RESULTS
     # =====================================================
 
     if not all_products:
 
         st.error(
-            "😕 No products were found."
+            "😕 No products found."
         )
 
         st.info(
-            "Try a broader product name, lower rating filter, "
-            "or fewer filters."
+            "Try a broader search such as "
+            "'shoes', 'tshirt' or 'laptop'."
         )
 
         st.stop()
+
+    # =====================================================
+    # DATAFRAME
+    # =====================================================
 
     df = pd.DataFrame(
         all_products
     )
 
-    # -----------------------------
+    # -----------------------------------------
+    # REMOVE DUPLICATES
+    # -----------------------------------------
+
+    df = df.drop_duplicates(
+        subset=["Link"]
+    )
+
+    # -----------------------------------------
     # PRICE FILTER
-    # -----------------------------
+    # -----------------------------------------
 
     if max_price > 0:
 
@@ -928,29 +1198,20 @@ if st.button(
             df["Price"] <= max_price
         ]
 
-    # -----------------------------
+    # -----------------------------------------
     # RATING FILTER
-    # -----------------------------
+    # -----------------------------------------
 
     if min_rating > 0:
 
-        # Keep products with unknown rating out
         df = df[
             df["Rating"].fillna(0)
             >= min_rating
         ]
 
-    # -----------------------------
-    # REMOVE DUPLICATES
-    # -----------------------------
-
-    df = df.drop_duplicates(
-        subset=["Link"]
-    )
-
-    # -----------------------------
+    # -----------------------------------------
     # SORT
-    # -----------------------------
+    # -----------------------------------------
 
     if sort_by == "Cheapest":
 
@@ -961,84 +1222,105 @@ if st.button(
 
     elif sort_by == "Highest Discount":
 
-        df["DiscountSort"] = df[
+        df["_sort"] = df[
             "Discount %"
         ].fillna(0)
 
         df = df.sort_values(
-            by="DiscountSort",
+            by="_sort",
             ascending=False
+        )
+
+        df = df.drop(
+            columns=["_sort"]
         )
 
     elif sort_by == "Best Rating":
 
-        df["RatingSort"] = df[
+        df["_sort"] = df[
             "Rating"
         ].fillna(0)
 
         df = df.sort_values(
-            by="RatingSort",
+            by="_sort",
             ascending=False
         )
 
-    # Reset index
+        df = df.drop(
+            columns=["_sort"]
+        )
+
     df = df.reset_index(
         drop=True
     )
 
     # =====================================================
-    # RESULTS
+    # SUMMARY
     # =====================================================
 
     st.success(
-        f"🔥 Found **{len(df)} products** across "
-        f"{len(stores)} store(s) and "
-        f"{int(pages_to_scrape)} page(s)."
+        f"🔥 {len(df)} products found"
     )
 
-    # =====================================================
-    # STORE SUMMARY
-    # =====================================================
+    col1, col2, col3 = st.columns(3)
 
-    summary_cols = st.columns(
-        len(stores)
-    )
+    with col1:
 
-    for i, store in enumerate(stores):
-
-        count = len(
-            df[df["Store"] == store]
+        st.metric(
+            "Products",
+            len(df)
         )
 
-        with summary_cols[i]:
+    with col2:
+
+        if len(df) > 0:
+
+            cheapest = df[
+                "Price"
+            ].min()
 
             st.metric(
-                store,
-                count
+                "Cheapest",
+                f"₹{cheapest:,.0f}"
             )
+
+    with col3:
+
+        if len(df) > 0:
+
+            best_discount = df[
+                "Discount %"
+            ].dropna()
+
+            if len(best_discount):
+
+                st.metric(
+                    "Best Discount",
+                    f"{best_discount.max():.0f}%"
+                )
 
     st.divider()
 
     # =====================================================
-    # PAGE-WISE RESULTS
+    # PAGE TABS
     # =====================================================
 
-    available_pages = sorted(
+    pages_found = sorted(
         df["Page"]
         .dropna()
         .unique()
     )
 
-    page_tabs = st.tabs(
+    tabs = st.tabs(
         [
-            f"📄 Page {int(page)}"
-            for page in available_pages
+            f"📄 Page {int(p)}"
+            for p in pages_found
         ]
     )
 
     for tab, page_number in zip(
-        page_tabs,
-        available_pages
+        tabs,
+        pages_found
     ):
 
         with tab:
@@ -1048,33 +1330,37 @@ if st.button(
             ]
 
             st.caption(
-                f"{len(page_df)} products found on Page {int(page_number)}"
+                f"{len(page_df)} products"
             )
 
-            # Product cards
+            # -----------------------------------------
+            # PRODUCT CARDS
+            # -----------------------------------------
+
             for _, row in page_df.iterrows():
 
                 with st.container(
                     border=True
                 ):
 
-                    col_img, col_info = st.columns(
+                    image_col, info_col = st.columns(
                         [1, 3]
                     )
 
-                    # -------------------------
                     # IMAGE
-                    # -------------------------
+                    with image_col:
 
-                    with col_img:
-
-                        image_url = row.get(
+                        image = row.get(
                             "Image"
                         )
 
                         if (
-                            image_url
-                            and str(image_url).startswith(
+                            image
+                            and isinstance(
+                                image,
+                                str
+                            )
+                            and image.startswith(
                                 "http"
                             )
                         ):
@@ -1082,7 +1368,7 @@ if st.button(
                             try:
 
                                 st.image(
-                                    image_url,
+                                    image,
                                     use_container_width=True
                                 )
 
@@ -1098,25 +1384,20 @@ if st.button(
                                 "📷 Image unavailable"
                             )
 
-                    # -------------------------
                     # INFO
-                    # -------------------------
-
-                    with col_info:
+                    with info_col:
 
                         st.markdown(
                             f"### {row['Product']}"
                         )
 
                         st.write(
-                            f"🛒 **{row['Store']}**  "
-                            f"• 📄 Page {int(row['Page'])}"
+                            f"🛒 {row['Store']} "
+                            f"• Page {int(row['Page'])}"
                         )
 
-                        price = row["Price"]
-
                         st.markdown(
-                            f"## ₹{price:,.0f}"
+                            f"## ₹{row['Price']:,.0f}"
                         )
 
                         if pd.notna(
@@ -1124,7 +1405,7 @@ if st.button(
                         ):
 
                             st.write(
-                                f"~~MRP ₹{row['MRP']:,.0f}~~"
+                                f"MRP: ₹{row['MRP']:,.0f}"
                             )
 
                         if pd.notna(
@@ -1132,7 +1413,8 @@ if st.button(
                         ):
 
                             st.success(
-                                f"🔥 {row['Discount %']:.0f}% OFF"
+                                f"🔥 "
+                                f"{row['Discount %']:.0f}% OFF"
                             )
 
                         if pd.notna(
@@ -1140,25 +1422,26 @@ if st.button(
                         ):
 
                             st.write(
-                                f"⭐ {row['Rating']:.1f}/5"
+                                f"⭐ "
+                                f"{row['Rating']:.1f}/5"
                             )
 
                         st.link_button(
-                            "🛍️ OPEN PRODUCT",
+                            "🛍️ Open Product",
                             row["Link"]
                         )
 
     # =====================================================
-    # TABLE
+    # COMPLETE TABLE
     # =====================================================
 
     st.divider()
 
     st.subheader(
-        "📊 All Products"
+        "📊 All Results"
     )
 
-    display_df = df[
+    table = df[
         [
             "Store",
             "Page",
@@ -1171,44 +1454,42 @@ if st.button(
         ]
     ].copy()
 
-    display_df["Price"] = display_df[
+    table["Price"] = table[
         "Price"
     ].apply(
-        lambda x: f"₹{x:,.0f}"
+        lambda x:
+        f"₹{x:,.0f}"
     )
 
-    display_df["MRP"] = display_df[
+    table["MRP"] = table[
         "MRP"
     ].apply(
-        lambda x: (
-            f"₹{x:,.0f}"
-            if pd.notna(x)
-            else "-"
-        )
+        lambda x:
+        f"₹{x:,.0f}"
+        if pd.notna(x)
+        else "-"
     )
 
-    display_df["Discount %"] = display_df[
+    table["Discount %"] = table[
         "Discount %"
     ].apply(
-        lambda x: (
-            f"{x:.0f}%"
-            if pd.notna(x)
-            else "-"
-        )
+        lambda x:
+        f"{x:.0f}%"
+        if pd.notna(x)
+        else "-"
     )
 
-    display_df["Rating"] = display_df[
+    table["Rating"] = table[
         "Rating"
     ].apply(
-        lambda x: (
-            f"{x:.1f}"
-            if pd.notna(x)
-            else "-"
-        )
+        lambda x:
+        f"{x:.1f}"
+        if pd.notna(x)
+        else "-"
     )
 
     st.dataframe(
-        display_df,
+        table,
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -1219,7 +1500,7 @@ if st.button(
     )
 
     # =====================================================
-    # CSV DOWNLOAD
+    # CSV
     # =====================================================
 
     csv = df.to_csv(
@@ -1227,8 +1508,9 @@ if st.button(
     ).encode("utf-8")
 
     st.download_button(
-        "⬇️ Download all results as CSV",
-        csv,
-        "deal_finder_results.csv",
-        "text/csv"
+        "⬇️ Download Results CSV",
+        data=csv,
+        file_name="deal_finder_results.csv",
+        mime="text/csv",
+        use_container_width=True
     )
